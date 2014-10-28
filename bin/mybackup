@@ -1,0 +1,229 @@
+#!/bin/sh
+
+# Config
+MYSQL_HOST="localhost"
+MYSQL_USER=""
+MYSQL_PASSWD=""
+STORAGE_DIR="/srv/mysql/backup"
+MYDUMPER="/usr/bin/mydumper"
+MYSQLDUMP="/usr/bin/mysqldump"
+MYDUMPER_THREADS="4"
+FIND="find"
+ADMIN_MAIL=""
+
+EXCLUDED_DATABASES="information_schema performance_schema"
+
+
+# Check if script already running
+runcheck=`ps ax | grep mybackup | grep -v grep | grep -v vi | grep -v nedit | grep -v nano | wc -l`;
+if [ $runcheck -gt 3 ];
+then
+        echo "'mybackup' already running. Exiting.";
+        exit 1;
+fi
+
+
+DATE=`date +%Y-%m-%d--%H-%M`;
+YEAR=`date +%Y`;
+MONTH=`date +%m`;
+WEEK=`date +%V`;
+DAY=`date +%d`;
+HOUR=`date +%H`;
+
+
+# base backup dir
+#mkdir -p $BACKUP_DIR/$DATE
+
+  # First check if we can connect
+conn_check=`mysql  -h $MYSQL_HOST --user=$MYSQL_USER --password=$MYSQL_PASSWD -s -e "exit"`
+if [ $? -ne 0 ];
+then
+	echo "Can't connect to MySQL on host '$MYSQL_HOST'. Exiting."
+	echo "Could not connect to MySQL server on host '$MYSQL_HOST'. Please review." | /usr/bin/mail -s 'MySQL Backup: Connection failed' $ADMIN_MAIL
+	exit 1
+fi
+
+
+## Hourly
+BACKUP_DIR_HOURLY="$STORAGE_DIR/hourly/$YEAR/$MONTH/$DAY/$HOUR";
+BACKUP_DIR_DAILY="$STORAGE_DIR/daily/$YEAR/$MONTH/$DAY";
+BACKUP_DIR_WEEKLY="$STORAGE_DIR/weekly/$YEAR/$WEEK";
+BACKUP_DIR_MONTHLY="$STORAGE_DIR/monthly/$YEAR";
+# check if destination directory exists, create if not
+if [ ! -d $BACKUP_DIR_HOURLY ];
+then
+      echo "Creating backup directory '$BACKUP_DIR_HOURLY'";
+      mkdir -p $BACKUP_DIR_HOURLY;
+fi
+
+# Get all databases to dump their schemas
+databases=`mysql -h $MYSQL_HOST --user=$MYSQL_USER --password=$MYSQL_PASSWD -s -e "SHOW DATABASES" | tr "\n" " ";`;
+
+for database in $databases;
+do
+
+exclude_db=0
+for excluded_database in $EXCLUDED_DATABASES
+do
+	if [ $database == $excluded_database ];
+	then
+		exclude_db=1
+	fi
+done
+
+# check if database is contained in excludes, start dump if not
+if [ $exclude_db -eq 0 ];
+then
+
+  SCHEMA_DIR="$BACKUP_DIR_HOURLY/schemas";
+
+  # check if destination directory exists, create if not
+  if [ ! -d $SCHEMA_DIR ];
+  then
+	    echo "Creating schema directory '$SCHEMA_DIR'.";
+	    mkdir -p $SCHEMA_DIR;
+  fi
+
+  # check if create of $SCHEMA_DIR has failed, exit if yes
+  if [ $? -eq 0 ];
+  then
+echo "Dumping database schemas to '$SCHEMA_DIR'.";
+
+    # store CREATE DATABASE with DROP DATABASE
+    mysqldump -q -a -c --max_allowed_packet=64M --single-transaction --user=$MYSQL_USER --password=$MYSQL_PASSWD --host=$MYSQL_HOST $database --add-drop-database --no-create-info --no-data -B > $SCHEMA_DIR/$database.sql;
+
+    # Check if command was successful
+    if [ $? -gt 0 ];
+    then
+	  echo "Error dumping database structure.";
+      echo "Could not dump dump database structure on host '$MYSQL_HOST'. Please review." | /usr/bin/mail -s 'MySQL Backup: Error dumping database structure' $ADMIN_MAIL
+	  exit 1;
+    fi
+  else
+    echo "Sorry. Could not create schema directory '$SCHEMA_DIR'. Exiting.";
+	echo "Could not create schema directory '$schema_dir' on host '$MYSQL_HOST'. Please review." | /usr/bin/mail -s 'MySQL Backup: Error creating schema directory' $ADMIN_MAIL
+    exit 1;
+  fi
+else
+    echo "Skipping database '$database': Excluded by host config.";
+    continue;
+fi
+done
+
+# Starting backups with mydumper
+date=`date +%Y-%m-%d_%H-%M`;
+echo "[$date] Starting data backups with mydumper"
+$MYDUMPER -o $BACKUP_DIR_HOURLY -c -e -L $BACKUP_DIR_HOURLY/log.log -u $MYSQL_USER -p $MYSQL_PASSWD -h $MYSQL_HOST -t $MYDUMPER_THREADS -v 3
+
+return_code=$?
+if [ $return_code -gt 0 ];
+then
+echo "Backup not successful. mydumper returned status code '$?'.";
+echo "Backup on host '$MYSQL_HOST' not successful. mydumper returned status code '$return_code'." | /usr/bin/mail -s 'MySQL Backup: Backup failed' $ADMIN_MAIL
+fi
+
+date=`date +%Y-%m-%d_%H-%M`;
+echo "[$date] Hourly Backup for host '$MYSQL_HOST' finished.";
+
+# Daily
+if [ ! -d $BACKUP_DIR_DAILY ];
+then
+    echo "Creating backup directory '$BACKUP_DIR_DAILY'";
+    mkdir -p $BACKUP_DIR_DAILY;
+    echo "Creating Daily Backup for host '$MYSQL_HOST'"
+    cp -r $BACKUP_DIR_HOURLY/* $BACKUP_DIR_DAILY/
+    date=`date +%Y-%m-%d_%H-%M`;
+	echo "[$date] Daily Backup for host '$MYSQL_HOST' finished.";
+fi
+
+# weekly
+if [ ! -d $BACKUP_DIR_WEEKLY ];
+then
+    echo "Creating backup directory '$BACKUP_DIR_WEEKLY'";
+    mkdir -p $BACKUP_DIR_WEEKLY;
+    echo "Creating weekly Backup for host '$MYSQL_HOST'"
+    cp -r $BACKUP_DIR_HOURLY/* $BACKUP_DIR_WEEKLY/
+    date=`date +%Y-%m-%d_%H-%M`;
+	echo "[$date] Weekly Backup for host '$MYSQL_HOST' finished.";
+fi
+
+# Monthly
+if [ ! -d $BACKUP_DIR_MONTHLY ];
+then
+    echo "Creating backup directory '$BACKUP_DIR_MONTHLY'";
+    mkdir -p $BACKUP_DIR_MONTHLY;
+    echo "Creating monthly Backup for host '$MYSQL_HOST'"
+    cp -r $BACKUP_DIR_HOURLY/* $BACKUP_DIR_MONTHLY/
+    date=`date +%Y-%m-%d_%H-%M`;
+	echo "[$date] Monthly Backup for host '$MYSQL_HOST' finished.";
+fi
+
+echo "[$date] All backups finished";
+echo "Clean old backup...";
+
+# clean hourly (48 heures)
+# find /srv/mysql/backup/hourly -type f -mmin +60 -exec rm {} \;
+$FIND $STORAGE_DIR/hourly -type f -mmin +2880 -exec rm -r {} \;
+
+# clean daily (7 jours)
+$FIND $STORAGE_DIR/monthly -type f -mtime +8 -exec rm -r {} \;
+
+# clean weekly (2 semaine)
+$FIND $STORAGE_DIR/weekly -type f -mtime +15 -exec rm -r {} \;
+
+# clean weekly (2 mois)
+$FIND $STORAGE_DIR/monthly -type f -mtime +61 -exec rm -r {} \;
+
+echo "Rotation done"
+
+echo "Clean empty dir..."
+DIRS=`$FIND $STORAGE_DIR/hourly -depth -type d -empty`
+for dir in $DIRS;
+do
+    rm -r $dir
+
+	if [ $? -gt 0 ];
+	then
+		echo "Could not delete directory '$dir'. Skipping."
+	fi
+done
+
+DIRS=`$FIND $STORAGE_DIR/daily -depth -type d -empty`
+for dir in $DIRS;
+do
+    rm -r $dir
+
+	if [ $? -gt 0 ];
+	then
+		echo "Could not delete directory '$dir'. Skipping."
+	fi
+done
+
+DIRS=`$FIND $STORAGE_DIR/weekly -depth -type d -empty`
+for dir in $DIRS;
+do
+    rm -r $dir
+
+	if [ $? -gt 0 ];
+	then
+		echo "Could not delete directory '$dir'. Skipping."
+	fi
+done
+
+DIRS=`$FIND $STORAGE_DIR/monthly -depth -type d -empty`
+for dir in $DIRS;
+do
+    rm -r $dir
+
+	if [ $? -gt 0 ];
+	then
+		echo "Could not delete directory '$dir'. Skipping."
+	fi
+done
+
+exit 0;
+
+
+
+
+
